@@ -651,4 +651,5 @@ process.on('uncaughtException', error => {
 });
 
 // Authenticate Bot Instance
-systemLog('info', 'Attempting connecti
+systemLog('info', 'Attempting connection handshake with Discord Gateway...');
+client.login(process.env.TOKEN);
