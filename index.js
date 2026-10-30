@@ -190,8 +190,18 @@ client.once('ready', async () => {
     console.log(`[Discord] Logged in as ${client.user.tag}!`);
     const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
     try {
-        await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
-        console.log('Successfully reloaded application (/) commands globally.');
+        if (process.env.GUILD_ID) {
+            // INSTANT GUILD REGISTRATION (Commands appear immediately)
+            await rest.put(
+                Routes.applicationGuildCommands(client.user.id, process.env.GUILD_ID),
+                { body: commands }
+            );
+            console.log(`Successfully reloaded commands instantly to guild: ${process.env.GUILD_ID}`);
+        } else {
+            // GLOBAL REGISTRATION (Can take up to an hour)
+            await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+            console.log('Successfully reloaded application (/) commands globally.');
+        }
     } catch (error) {
         console.error(error);
     }
@@ -274,7 +284,6 @@ client.on('messageCreate', async (message) => {
 // --- INTERACTION HANDLER ---
 client.on('interactionCreate', async (interaction) => {
     try {
-        // Handle Modals separately because they cannot be deferred beforehand
         if (interaction.isModalSubmit()) {
             const key = interaction.customId.replace('modal_', '');
             const title = interaction.fields.getTextInputValue('embed_title');
@@ -306,7 +315,6 @@ client.on('interactionCreate', async (interaction) => {
             return;
         }
 
-        // Handle Select Menu opening a modal
         if (interaction.isStringSelectMenu()) {
             if (interaction.customId === 'dashboard_select') {
                 const key = interaction.values[0].replace('edit_', '');
@@ -317,7 +325,6 @@ client.on('interactionCreate', async (interaction) => {
             }
         }
 
-        // Handle Button clicks triggering modals
         if (interaction.isButton()) {
             if (interaction.customId === 'open_welcome_modal') {
                 const config = await getConfig('welcome');
@@ -327,7 +334,6 @@ client.on('interactionCreate', async (interaction) => {
             }
         }
 
-        // Defer reply for standard chat inputs to prevent timeouts
         if (interaction.isChatInputCommand()) {
             await interaction.deferReply({ ephemeral: true });
 
