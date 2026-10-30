@@ -1,655 +1,495 @@
-/**
- * ----------------------------------------------------------------------------------
- * PROJECT: Advanced Discord Moderation & Embed Dashboard Bot
- * VERSION: 3.0.0 (Enterprise Architecture Monolith)
- * AUTHOR: Z
- * ----------------------------------------------------------------------------------
- */
-
 const { 
-  Client, 
-  GatewayIntentBits, 
-  REST, 
-  Routes, 
-  SlashCommandBuilder, 
-  EmbedBuilder, 
-  ActionRowBuilder, 
-  ButtonBuilder, 
-  ButtonStyle, 
-  ModalBuilder, 
-  TextInputBuilder, 
-  TextInputStyle, 
-  PermissionFlagsBits 
+    Client, 
+    GatewayIntentBits, 
+    PermissionFlagsBits, 
+    EmbedBuilder, 
+    REST, 
+    Routes, 
+    SlashCommandBuilder, 
+    ActionRowBuilder, 
+    StringSelectMenuBuilder, 
+    ModalBuilder, 
+    TextInputBuilder, 
+    TextInputStyle,
+    ButtonBuilder,
+    ButtonStyle,
+    ChannelType
 } = require('discord.js');
+const Datastore = require('nedb-promises');
 require('dotenv').config();
 
-// ==========================================
-// 1. CLIENT INITIALIZATION & INTENTS
-// ==========================================
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildModeration,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ]
-});
+// Use whichever token variable your host uses
+const TOKEN = process.env.TOKEN || process.env.DISCORD_TOKEN;
+const GUILD_ID = process.env.GUILD_ID;
 
-const PREFIX = '?';
+if (!TOKEN) {
+    console.error('❌ CRITICAL ERROR: No Bot Token found in environment variables (TOKEN or DISCORD_TOKEN)!');
+    process.exit(1);
+}
 
-// ==========================================
-// 2. CENTRAL CONFIGURATION & STATE STORE
-// ==========================================
-const botConfig = {
-  version: '3.0.0',
-  environment: process.env.NODE_ENV || 'production',
-  commands: {
-    ban: {
-      enabled: true,
-      name: 'ban',
-      public: true,
-      sendDm: true,
-      title: 'User Banned',
-      description: 'You have been banned from {guild}. Reason: {reason}',
-      thumbnail: '',
-      image: '',
-      buttonStyle: 'separate'
+// --- DATABASE SETUP ---
+const db = Datastore.create({ filename: 'settings.db', autoload: true });
+const levelsDb = Datastore.create({ filename: 'levels.db', autoload: true });
+
+// --- DEFAULT EMBED CONFIGURATIONS ---
+const defaultSettings = {
+    ban: { title: '🔨 Member Banned', color: '#ff0000', thumbnail: '', image: '', description: 'User **{user}** has been banned.\n**Reason:** {reason}' },
+    kick: { title: '👢 Member Kicked', color: '#ffa500', thumbnail: '', image: '', description: 'User **{user}** has been kicked.\n**Reason:** {reason}' },
+    mute: { title: '🔇 Member Muted', color: '#ffcc00', thumbnail: '', image: '', description: 'User **{user}** has been muted.\n**Reason:** {reason}' },
+    unmute: { title: '🔊 Member Unmuted', color: '#00ff00', thumbnail: '', image: '', description: 'User **{user}** has been unmuted.' },
+    warn: { title: '⚠️ Member Warned', color: '#ffff00', thumbnail: '', image: '', description: 'User **{user}** has received a warning.\n**Reason:** {reason}' },
+    welcome: { 
+        title: '👋 Welcome to the Server!', 
+        color: '#5865F2', 
+        thumbnail: '', 
+        image: '',
+        description: 'Hey {user}, welcome to **{server}**! We are thrilled to have you here. You are member #{memberCount}.', 
+        channelId: '' 
     },
-    unban: {
-      enabled: true,
-      name: 'unban',
-      public: true,
-      sendDm: true,
-      title: 'User Unbanned',
-      description: 'Your ban from {guild} has been lifted.',
-      thumbnail: '',
-      image: '',
-      buttonStyle: 'separate'
-    },
-    mute: {
-      enabled: true,
-      name: 'mute',
-      public: true,
-      sendDm: true,
-      title: 'User Muted',
-      description: 'You have been muted in {guild} for {duration}. Reason: {reason}',
-      thumbnail: '',
-      image: '',
-      buttonStyle: 'separate'
-    },
-    unmute: {
-      enabled: true,
-      name: 'unmute',
-      public: true,
-      sendDm: true,
-      title: 'User Unmuted',
-      description: 'Your mute in {guild} has been lifted.',
-      thumbnail: '',
-      image: '',
-      buttonStyle: 'separate'
+    leveling: {
+        title: '🎉 Level Up!',
+        color: '#00ffcc',
+        thumbnail: '',
+        image: '',
+        description: 'GG {user}! You just advanced to **Level {level}**!'
     }
-  }
 };
 
-// ==========================================
-// 3. ADVANCED UTILITY FUNCTIONS
-// ==========================================
-
-/**
- * Parses time strings like '30s', '15m', '2h', '1d' into milliseconds.
- * @param {string} durationStr 
- * @returns {number|null}
- */
-function parseDuration(durationStr) {
-  if (!durationStr || typeof durationStr !== 'string') return null;
-  const regex = /^(\d+)([smhd])$/i;
-  const match = durationStr.match(regex);
-  if (!match) return null;
-
-  const value = parseInt(match[1], 10);
-  const unit = match[2].toLowerCase();
-
-  switch (unit) {
-    case 's': return value * 1000;
-    case 'm': return value * 60 * 1000;
-    case 'h': return value * 60 * 60 * 1000;
-    case 'd': return value * 24 * 60 * 60 * 1000;
-    default: return null;
-  }
+async function getConfig(key) {
+    let setting = await db.findOne({ command: key });
+    return setting || defaultSettings[key];
 }
 
-/**
- * Validates whether a given string is a proper HTTP/HTTPS URL.
- * @param {string} url 
- * @returns {boolean}
- */
-function isValidHttpUrl(url) {
-  if (!url) return true; // Optional fields can be empty
-  let parsedUrl;
-  try {
-    parsedUrl = new URL(url);
-  } catch (_) {
-    return false;
-  }
-  return parsedUrl.protocol === 'http:' || parsedUrl.protocol === 'https:';
+// Helper to open the customization modal
+function createEmbedModal(key, config) {
+    const modal = new ModalBuilder()
+        .setCustomId(`modal_${key}`)
+        .setTitle(`Customize: ${key.toUpperCase()}`);
+
+    const titleInput = new TextInputBuilder()
+        .setCustomId('embed_title')
+        .setLabel('Embed Title')
+        .setStyle(TextInputStyle.Short)
+        .setValue(config.title || '')
+        .setRequired(true);
+
+    const colorInput = new TextInputBuilder()
+        .setCustomId('embed_color')
+        .setLabel('Color (Hex, e.g. #5865F2)')
+        .setStyle(TextInputStyle.Short)
+        .setValue(config.color || '#5865F2')
+        .setRequired(true);
+
+    const thumbInput = new TextInputBuilder()
+        .setCustomId('embed_thumbnail')
+        .setLabel('Thumbnail URL (Optional)')
+        .setStyle(TextInputStyle.Short)
+        .setValue(config.thumbnail || '')
+        .setRequired(false);
+
+    const imageInput = new TextInputBuilder()
+        .setCustomId('embed_image')
+        .setLabel('Image / GIF URL (Optional)')
+        .setStyle(TextInputStyle.Short)
+        .setValue(config.image || '')
+        .setRequired(false);
+
+    const descInput = new TextInputBuilder()
+        .setCustomId('embed_desc')
+        .setLabel('Description Content')
+        .setStyle(TextInputStyle.Paragraph)
+        .setValue(config.description || '')
+        .setRequired(true);
+
+    modal.addComponents(
+        new ActionRowBuilder().addComponents(titleInput),
+        new ActionRowBuilder().addComponents(colorInput),
+        new ActionRowBuilder().addComponents(thumbInput),
+        new ActionRowBuilder().addComponents(imageInput),
+        new ActionRowBuilder().addComponents(descInput)
+    );
+
+    return modal;
 }
 
-/**
- * Generates custom action rows depending on configuration button layout style.
- * @param {string} cmdKey 
- * @returns {ActionRowBuilder[]}
- */
-function buildCommandButtons(cmdKey) {
-  const cfg = botConfig.commands[cmdKey];
-  if (!cfg) return [];
+// --- DISCORD CLIENT SETUP ---
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent
+    ]
+});
 
-  if (cfg.buttonStyle === 'slide') {
-    return [
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId(`slide_prev_${cmdKey}`)
-          .setLabel('◀ Prev Slide')
-          .setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder()
-          .setCustomId(`slide_next_${cmdKey}`)
-          .setLabel('Next Slide ▶')
-          .setStyle(ButtonStyle.Secondary)
-      )
-    ];
-  } else {
-    return [
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId(`action_approve_${cmdKey}`)
-          .setLabel('Log Action')
-          .setStyle(ButtonStyle.Success),
-        new ButtonBuilder()
-          .setCustomId(`action_dismiss_${cmdKey}`)
-          .setLabel('Dismiss')
-          .setStyle(ButtonStyle.Danger)
-      )
-    ];
-  }
-}
+// --- REGISTER SLASH COMMANDS ---
+const commands = [
+    new SlashCommandBuilder()
+        .setName('embed')
+        .setDescription('Embed dashboard and customization commands')
+        .addSubcommand(sub => 
+            sub.setName('dashboard')
+               .setDescription('Open the interactive embed customization dashboard')
+        )
+        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    
+    new SlashCommandBuilder()
+        .setName('welcome')
+        .setDescription('Manage the welcome channel, embed customization, or run a test')
+        .addChannelOption(option => 
+            option.setName('channel')
+                  .setDescription('Set the text channel for welcome greetings')
+                  .addChannelTypes(ChannelType.GuildText)
+                  .setRequired(false)
+        )
+        .addStringOption(option => 
+            option.setName('action')
+                  .setDescription('Configure or preview welcome messages')
+                  .setRequired(false)
+                  .addChoices(
+                      { name: 'Customize Embed', value: 'customize' },
+                      { name: 'Test Welcome', value: 'test' }
+                  )
+        )
+        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
-/**
- * Structured logger for debugging execution states.
- * @param {string} level 
- * @param {string} message 
- */
-function systemLog(level, message) {
-  const timestamp = new Date().toISOString();
-  console.log(`[${timestamp}] [${level.toUpperCase()}] ${message}`);
-}
+    new SlashCommandBuilder()
+        .setName('ban')
+        .setDescription('Ban a member from the server')
+        .addUserOption(option => option.setName('user').setDescription('The user to ban').setRequired(true))
+        .addIntegerOption(option => option.setName('duration').setDescription('Optional duration in minutes for temporary ban').setRequired(false))
+        .addStringOption(option => option.setName('reason').setDescription('Reason for the ban').setRequired(false))
+        .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers),
 
-// ==========================================
-// 4. SLASH COMMAND DEFINITIONS (BUILDER)
-// ==========================================
-const slashCommands = [
-  new SlashCommandBuilder()
-    .setName('embed-dashboard')
-    .setDescription('Edit custom command embeds, text, descriptions, thumbnail URLs, images, and button layouts.')
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    new SlashCommandBuilder()
+        .setName('kick')
+        .setDescription('Kick a member from the server')
+        .addUserOption(option => option.setName('user').setDescription('The user to kick').setRequired(true))
+        .addStringOption(option => option.setName('reason').setDescription('Reason for the kick').setRequired(false))
+        .setDefaultMemberPermissions(PermissionFlagsBits.KickMembers),
 
-  new SlashCommandBuilder()
-    .setName('moderation-dashboard')
-    .setDescription('Enable, disable, update status, and configure command visibility and DM notifications.')
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    new SlashCommandBuilder()
+        .setName('mute')
+        .setDescription('Timeout/mute a member')
+        .addUserOption(option => option.setName('user').setDescription('The user to mute').setRequired(true))
+        .addIntegerOption(option => option.setName('duration').setDescription('Duration in minutes (default 60)').setRequired(false))
+        .addStringOption(option => option.setName('reason').setDescription('Reason for the mute').setRequired(false))
+        .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
 
-  new SlashCommandBuilder()
-    .setName('ban')
-    .setDescription('Ban a member from the current guild with customizable embed notification.')
-    .addUserOption(opt => 
-      opt.setName('target')
-         .setDescription('The user you want to ban')
-         .setRequired(true)
-    )
-    .addStringOption(opt => 
-      opt.setName('reason')
-         .setDescription('Reason for banning this user')
-         .setRequired(false)
-    ),
+    new SlashCommandBuilder()
+        .setName('unmute')
+        .setDescription('Remove timeout from a member')
+        .addUserOption(option => option.setName('user').setDescription('The user to unmute').setRequired(true))
+        .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
 
-  new SlashCommandBuilder()
-    .setName('unban')
-    .setDescription('Unban a user using their unique Discord account ID.')
-    .addStringOption(opt => 
-      opt.setName('userid')
-         .setDescription('The 18-digit user ID to unban')
-         .setRequired(true)
-    ),
+    new SlashCommandBuilder()
+        .setName('warn')
+        .setDescription('Issue a warning embed to a member')
+        .addUserOption(option => option.setName('user').setDescription('The user to warn').setRequired(true))
+        .addStringOption(option => option.setName('reason').setDescription('Reason for warning').setRequired(true))
+        .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
 
-  new SlashCommandBuilder()
-    .setName('mute')
-    .setDescription('Timeout/mute a member using flexible time parameters (e.g. 30s, 15m, 2h, 1d).')
-    .addUserOption(opt => 
-      opt.setName('target')
-         .setDescription('The member to mute')
-         .setRequired(true)
-    )
-    .addStringOption(opt => 
-      opt.setName('duration')
-         .setDescription('Duration format: Xs, Xm, Xh, or Xd (e.g. 10m)')
-         .setRequired(true)
-    )
-    .addStringOption(opt => 
-      opt.setName('reason')
-         .setDescription('Reason for timeout')
-         .setRequired(false)
-    ),
+    new SlashCommandBuilder()
+        .setName('rank')
+        .setDescription('Check your current level and XP')
+        .addUserOption(option => option.setName('user').setDescription('The user to check rank for').setRequired(false))
+].map(command => command.toJSON());
 
-  new SlashCommandBuilder()
-    .setName('unmute')
-    .setDescription('Remove a timeout restriction from a member.')
-    .addUserOption(opt => 
-      opt.setName('target')
-         .setDescription('The member to unmute')
-         .setRequired(true)
-    )
-].map(c => c.toJSON());
-
-// ==========================================
-// 5. CLIENT READY & REST DEPLOYMENT HOOK
-// ==========================================
 client.once('ready', async () => {
-  systemLog('info', `Bot successfully authenticated as ${client.user.tag}`);
-  systemLog('info', `Active configuration profile loaded. Registered commands count: ${slashCommands.length}`);
-
-  const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
-
-  try {
-    if (process.env.GUILD_ID) {
-      systemLog('info', `Initiating instant guild-level command sync for target Guild ID: ${process.env.GUILD_ID}`);
-      await rest.put(
-        Routes.applicationGuildCommands(client.user.id, process.env.GUILD_ID),
-        { body: slashCommands },
-      );
-      systemLog('info', '✅ Guild commands synchronized successfully and instantly available.');
-    } else {
-      systemLog('warn', 'GUILD_ID is not defined in .env. Falling back to global synchronization.');
-      await rest.put(
-        Routes.applicationCommands(client.user.id),
-        { body: slashCommands },
-      );
-      systemLog('info', '✅ Global application commands registered successfully.');
+    console.log(`[Discord] Logged in successfully as ${client.user.tag}!`);
+    const rest = new REST({ version: '10' }).setToken(TOKEN);
+    
+    try {
+        if (GUILD_ID) {
+            await rest.put(
+                Routes.applicationGuildCommands(client.user.id, GUILD_ID),
+                { body: commands }
+            );
+            console.log(`[Commands] Successfully synchronized commands instantly to Guild ID: ${GUILD_ID}`);
+        } else {
+            await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+            console.log('[Commands] Successfully registered application (/) commands globally.');
+        }
+    } catch (error) {
+        console.error('[Commands Error] Failed to register slash commands:', error);
     }
-  } catch (error) {
-    systemLog('error', `Critical failure during REST command registration: ${error.message}`);
-    console.error(error);
-  }
 });
 
-// ==========================================
-// 6. CORE COMMAND EXECUTION ENGINE
-// ==========================================
-async function executeCommand(context, commandKey, args, isInteraction) {
-  const cfg = botConfig.commands[commandKey];
-  
-  if (!cfg) {
-    systemLog('error', `Attempted to execute unmapped command key: ${commandKey}`);
-    return;
-  }
-
-  // Check if command is enabled in configuration dashboard
-  if (!cfg.enabled) {
-    const disabledMsg = '⚠️ This command has been temporarily disabled by server administrators via the moderation dashboard.';
-    return isInteraction ? context.reply({ content: disabledMsg, ephemeral: true }) : context.reply(disabledMsg);
-  }
-
-  const guild = context.guild;
-  if (!guild) {
-    const guildErr = 'This command can only be executed within a server channel.';
-    return isInteraction ? context.reply({ content: guildErr, ephemeral: true }) : context.reply(guildErr);
-  }
-
-  let targetUser = null;
-  let targetMember = null;
-  let reason = 'No reason provided';
-  let durationStr = null;
-  let durationMs = null;
-  let userId = null;
-
-  // Resolve Arguments based on interaction vs prefix context
-  if (isInteraction) {
-    if (commandKey === 'ban' || commandKey === 'mute') {
-      targetMember = context.options.getMember('target');
-      targetUser = targetMember?.user || null;
-      reason = context.options.getString('reason') || 'No reason provided';
-    }
-    if (commandKey === 'mute') {
-      durationStr = context.options.getString('duration');
-      durationMs = parseDuration(durationStr);
-    }
-    if (commandKey === 'unban') {
-      userId = context.options.getString('userid');
-    }
-    if (commandKey === 'unmute') {
-      targetMember = context.options.getMember('target');
-      targetUser = targetMember?.user || null;
-    }
-  } else {
-    // Prefix execution flow (?command)
-    if (commandKey === 'ban' || commandKey === 'mute' || commandKey === 'unmute') {
-      targetMember = context.mentions.members.first() || guild.members.cache.get(args[0]);
-      targetUser = targetMember?.user || null;
-      reason = args.slice(commandKey === 'mute' ? 2 : 1).join(' ') || 'No reason provided';
-    }
-    if (commandKey === 'mute') {
-      durationStr = args[1];
-      durationMs = parseDuration(durationStr);
-    }
-    if (commandKey === 'unban') {
-      userId = args[0];
-    }
-  }
-
-  // --- EXECUTION LOGIC PER COMMAND TYPE ---
-  try {
-    if (commandKey === 'ban') {
-      if (!targetMember || !targetMember.bannable) {
-        const errBan = '❌ Error: Invalid target member or insufficient bot role hierarchy permissions to ban this user.';
-        return isInteraction ? context.reply({ content: errBan, ephemeral: true }) : context.reply(errBan);
-      }
-
-      if (cfg.sendDm && targetUser) {
-        try {
-          const dmEmbed = new EmbedBuilder()
-            .setTitle(cfg.title)
-            .setDescription(cfg.description.replace('{guild}', guild.name).replace('{reason}', reason))
-            .setColor(0xFF0000)
-            .setTimestamp();
-          if (isValidHttpUrl(cfg.thumbnail)) dmEmbed.setThumbnail(cfg.thumbnail);
-          if (isValidHttpUrl(cfg.image)) dmEmbed.setImage(cfg.image);
-          await targetUser.send({ embeds: [dmEmbed] });
-        } catch (dmErr) {
-          systemLog('warn', `Could not dispatch ban DM notification to user: ${targetUser.tag}`);
-        }
-      }
-      await guild.members.ban(targetMember, { reason });
-    } 
+// Helper function to build custom embeds dynamically
+async function buildEmbed(key, variables) {
+    const config = await getConfig(key);
+    let desc = config.description;
     
-    else if (commandKey === 'unban') {
-      if (!userId) {
-        const errUnban = '❌ Error: You must supply a valid 18-digit user account ID to unban.';
-        return isInteraction ? context.reply({ content: errUnban, ephemeral: true }) : context.reply(errUnban);
-      }
-      await guild.members.unban(userId);
-    } 
-    
-    else if (commandKey === 'mute') {
-      if (!targetMember || !durationMs) {
-        const errMute = '❌ Error: Invalid member target or incorrect duration format! Use strings like `30s`, `15m`, `2h`, or `1d`.';
-        return isInteraction ? context.reply({ content: errMute, ephemeral: true }) : context.reply(errMute);
-      }
-
-      if (cfg.sendDm && targetUser) {
-        try {
-          const dmEmbed = new EmbedBuilder()
-            .setTitle(cfg.title)
-            .setDescription(
-              cfg.description
-                .replace('{guild}', guild.name)
-                .replace('{duration}', durationStr)
-                .replace('{reason}', reason)
-            )
-            .setColor(0xFFA500)
-            .setTimestamp();
-          if (isValidHttpUrl(cfg.thumbnail)) dmEmbed.setThumbnail(cfg.thumbnail);
-          if (isValidHttpUrl(cfg.image)) dmEmbed.setImage(cfg.image);
-          await targetUser.send({ embeds: [dmEmbed] });
-        } catch (dmErr) {
-          systemLog('warn', `Could not dispatch mute DM notification to user: ${targetUser.tag}`);
-        }
-      }
-      await targetMember.timeout(durationMs, reason);
-    } 
-    
-    else if (commandKey === 'unmute') {
-      if (!targetMember) {
-        const errUnmute = '❌ Error: Target member not found or invalid specification.';
-        return isInteraction ? context.reply({ content: errUnmute, ephemeral: true }) : context.reply(errUnmute);
-      }
-      await targetMember.timeout(null);
+    for (const [valKey, val] of Object.entries(variables)) {
+        desc = desc.replace(new RegExp(`\\{${valKey}\\}`, 'g'), val);
     }
 
-  } catch (executionError) {
-    systemLog('error', `Execution failure inside module [${commandKey}]: ${executionError.message}`);
-    const failNotice = '⚠️ An internal API error occurred while attempting to execute this moderation action.';
-    return isInteraction ? context.reply({ content: failNotice, ephemeral: true }) : context.reply(failNotice);
-  }
+    const embed = new EmbedBuilder()
+        .setTitle(config.title)
+        .setColor(config.color)
+        .setDescription(desc)
+        .setTimestamp();
 
-  // --- RENDER PUBLIC EMBED & BUTTON COMPONENTS ---
-  const publicEmbed = new EmbedBuilder()
-    .setTitle(cfg.title)
-    .setDescription(
-      cfg.description
-        .replace('{guild}', guild.name)
-        .replace('{reason}', reason || 'N/A')
-        .replace('{duration}', durationStr || 'N/A')
-        .replace('{user}', targetUser ? targetUser.tag : (userId || 'N/A'))
-    )
-    .setColor(0x00AE86)
-    .setTimestamp();
+    if (config.thumbnail && config.thumbnail.startsWith('http')) embed.setThumbnail(config.thumbnail);
+    if (config.image && config.image.startsWith('http')) embed.setImage(config.image);
 
-  if (isValidHttpUrl(cfg.thumbnail)) publicEmbed.setThumbnail(cfg.thumbnail);
-  if (isValidHttpUrl(cfg.image)) publicEmbed.setImage(cfg.image);
-
-  const actionComponents = buildCommandButtons(commandKey);
-  const payload = {
-    embeds: [publicEmbed],
-    components: actionComponents,
-    ephemeral: !cfg.public
-  };
-
-  return context.reply(payload);
+    return embed;
 }
 
-// ==========================================
-// 7. EVENT HANDLERS (INTERACTIONS & MESSAGES)
-// ==========================================
+// --- WELCOME EVENT LISTENER ---
+client.on('guildMemberAdd', async (member) => {
+    const config = await getConfig('welcome');
+    if (!config.channelId) return;
 
-// Chat Input & Component Interaction Listener
-client.on('interactionCreate', async interaction => {
-  try {
-    // A. Slash Command Handler
-    if (interaction.isChatInputCommand()) {
-      const { commandName } = interaction;
-      systemLog('info', `Received chat input interaction: /${commandName} from user ${interaction.user.tag}`);
+    const channel = member.guild.channels.cache.get(config.channelId);
+    if (!channel) return;
 
-      if (commandName === 'embed-dashboard') {
-        const dashboardRow = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId('edit_embed_ban').setLabel('Edit /ban Embed').setStyle(ButtonStyle.Primary),
-          new ButtonBuilder().setCustomId('edit_embed_mute').setLabel('Edit /mute Embed').setStyle(ButtonStyle.Primary),
-          new ButtonBuilder().setCustomId('toggle_layout_ban').setLabel('Toggle Button Style (Slide/Sep)').setStyle(ButtonStyle.Secondary)
-        );
+    const embed = await buildEmbed('welcome', {
+        user: `<@${member.id}>`,
+        server: member.guild.name,
+        memberCount: member.guild.memberCount
+    });
 
-        return interaction.reply({
-          content: '**🎨 Embed Dashboard Control Panel**\nSelect an action below to modify embed titles, markdown body descriptions, images, thumbnails, and interactive row styles.',
-          components: [dashboardRow],
-          ephemeral: false
-        });
-      }
-
-      else if (commandName === 'moderation-dashboard') {
-        const statusSummary = Object.entries(botConfig.commands).map(([key, val]) => 
-          `• **/${val.name}** | Status: \`${val.enabled ? 'Enabled' : 'Disabled'}\` | Public: \`${val.public}\` | DMs: \`${val.sendDm}\``
-        ).join('\n');
-
-        const modRow = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId('mod_toggle_ban').setLabel('Toggle /ban').setStyle(ButtonStyle.Secondary),
-          new ButtonBuilder().setCustomId('mod_toggle_mute').setLabel('Toggle /mute').setStyle(ButtonStyle.Secondary),
-          new ButtonBuilder().setCustomId('mod_toggle_dm_ban').setLabel('Toggle Ban DM').setStyle(ButtonStyle.Secondary)
-        );
-
-        return interaction.reply({
-          content: `**⚙️ Moderation Settings Dashboard**\n\n${statusSummary}\n\n*Use control keys below to reconfigure parameters:*`,
-          components: [modRow],
-          ephemeral: false
-        });
-      }
-
-      else if (['ban', 'unban', 'mute', 'unmute'].includes(commandName)) {
-        await executeCommand(interaction, commandName, [], true);
-      }
+    if (!config.thumbnail) {
+        embed.setThumbnail(member.user.displayAvatarURL());
     }
 
-    // B. Button Click Handler
-    else if (interaction.isButton()) {
-      const customId = interaction.customId;
-      systemLog('info', `Button interaction triggered: ${customId} by ${interaction.user.tag}`);
+    await channel.send({ content: `<@${member.id}>`, embeds: [embed] }).catch(() => {});
+});
 
-      if (customId === 'edit_embed_ban' || customId === 'edit_embed_mute') {
-        const targetCmd = customId.includes('ban') ? 'ban' : 'mute';
-        const currentData = botConfig.commands[targetCmd];
+// --- LEVELING SYSTEM EVENT LISTENER ---
+client.on('messageCreate', async (message) => {
+    if (message.author.bot || !message.guild) return;
 
-        const modal = new ModalBuilder()
-          .setCustomId(`modal_edit_${targetCmd}`)
-          .setTitle(`Customize /${targetCmd} Embed`);
+    const userId = message.author.id;
+    const guildId = message.guild.id;
 
-        const titleInput = new TextInputBuilder()
-          .setCustomId('input_title')
-          .setLabel('Embed Title')
-          .setStyle(TextInputStyle.Short)
-          .setValue(currentData.title)
-          .setRequired(true);
+    let userXpData = await levelsDb.findOne({ userId, guildId });
+    const xpToAdd = Math.floor(Math.random() * 10) + 15;
 
-        const descInput = new TextInputBuilder()
-          .setCustomId('input_desc')
-          .setLabel('Description Template')
-          .setStyle(TextInputStyle.Paragraph)
-          .setValue(currentData.description)
-          .setRequired(true);
-
-        const thumbInput = new TextInputBuilder()
-          .setCustomId('input_thumb')
-          .setLabel('Thumbnail URL (Optional)')
-          .setStyle(TextInputStyle.Short)
-          .setValue(currentData.thumbnail || '')
-          .setRequired(false);
-
-        const imageInput = new TextInputBuilder()
-          .setCustomId('input_image')
-          .setLabel('Image URL (Optional)')
-          .setStyle(TextInputStyle.Short)
-          .setValue(currentData.image || '')
-          .setRequired(false);
-
-        modal.addComponents(
-          new ActionRowBuilder().addComponents(titleInput),
-          new ActionRowBuilder().addComponents(descInput),
-          new ActionRowBuilder().addComponents(thumbInput),
-          new ActionRowBuilder().addComponents(imageInput)
-        );
-
-        return await interaction.showModal(modal);
-      }
-
-      else if (customId === 'toggle_layout_ban') {
-        botConfig.commands.ban.buttonStyle = botConfig.commands.ban.buttonStyle === 'separate' ? 'slide' : 'separate';
-        return interaction.update({
-          content: `✅ Ban action layout updated. Current style: **${botConfig.commands.ban.buttonStyle}**`
-        });
-      }
-
-      else if (customId.startsWith('mod_toggle_')) {
-        const tokens = customId.split('_');
-        const actionType = tokens[2]; // toggle or dm
-        const subjectCmd = tokens[3]; // ban or mute
-
-        if (actionType === 'toggle') {
-          botConfig.commands[subjectCmd].enabled = !botConfig.commands[subjectCmd].enabled;
-          return interaction.update({
-            content: `⚙️ Command \`/${subjectCmd}\` state updated to: **${botConfig.commands[subjectCmd].enabled ? 'Enabled' : 'Disabled'}**`
-          });
-        } else if (actionType === 'dm') {
-          botConfig.commands[subjectCmd].sendDm = !botConfig.commands[subjectCmd].sendDm;
-          return interaction.update({
-            content: `⚙️ DM notifications for \`/${subjectCmd}\` updated to: **${botConfig.commands[subjectCmd].sendDm ? 'Enabled' : 'Disabled'}**`
-          });
-        }
-      }
-
-      else if (customId.startsWith('action_') || customId.startsWith('slide_')) {
-        return interaction.reply({
-          content: 'ℹ️ Interactive button action registered successfully.',
-          ephemeral: true
-        });
-      }
+    if (!userXpData) {
+        userXpData = { userId, guildId, xp: xpToAdd, level: 1 };
+    } else {
+        userXpData.xp += xpToAdd;
     }
 
-    // C. Modal Submission Handler
-    else if (interaction.isModalSubmit()) {
-      const modalId = interaction.customId;
-      systemLog('info', `Modal submitted: ${modalId} by ${interaction.user.tag}`);
+    const neededXp = userXpData.level * 100;
+    if (userXpData.xp >= neededXp) {
+        userXpData.level += 1;
+        userXpData.xp -= neededXp;
 
-      if (modalId === 'modal_edit_ban' || modalId === 'modal_edit_mute') {
-        const targetCmd = modalId.includes('ban') ? 'ban' : 'mute';
-        
-        const newTitle = interaction.fields.getTextInputValue('input_title');
-        const newDesc = interaction.fields.getTextInputValue('input_desc');
-        const newThumb = interaction.fields.getTextInputValue('input_thumb');
-        const newImage = interaction.fields.getTextInputValue('input_image');
+        const embed = await buildEmbed('leveling', {
+            user: `<@${userId}>`,
+            level: userXpData.level
+        });
 
-        if (!isValidHttpUrl(newThumb) || !isValidHttpUrl(newImage)) {
-          return interaction.reply({
-            content: '❌ Validation Error: Please provide valid HTTP or HTTPS URLs for image and thumbnail fields.',
-            ephemeral: true
-          });
+        await message.channel.send({ embeds: [embed] }).catch(() => {});
+    }
+
+    await levelsDb.update({ userId, guildId }, userXpData, { upsert: true });
+});
+
+// --- INTERACTION HANDLER ---
+client.on('interactionCreate', async (interaction) => {
+    try {
+        if (interaction.isModalSubmit()) {
+            const key = interaction.customId.replace('modal_', '');
+            const title = interaction.fields.getTextInputValue('embed_title');
+            const color = interaction.fields.getTextInputValue('embed_color');
+            const thumbnail = interaction.fields.getTextInputValue('embed_thumbnail');
+            const image = interaction.fields.getTextInputValue('embed_image');
+            const description = interaction.fields.getTextInputValue('embed_desc');
+
+            let currentConfig = await getConfig(key);
+
+            await db.update(
+                { command: key },
+                { 
+                    command: key, 
+                    channelId: currentConfig.channelId || '', 
+                    title, 
+                    color, 
+                    thumbnail, 
+                    image, 
+                    description 
+                },
+                { upsert: true }
+            );
+
+            await interaction.reply({ 
+                content: `✅ Successfully updated the configuration and embed for **${key}**!`, 
+                ephemeral: true 
+            });
+            return;
         }
 
-        botConfig.commands[targetCmd].title = newTitle;
-        botConfig.commands[targetCmd].description = newDesc;
-        botConfig.commands[targetCmd].thumbnail = newThumb;
-        botConfig.commands[targetCmd].image = newImage;
+        if (interaction.isStringSelectMenu()) {
+            if (interaction.customId === 'dashboard_select') {
+                const key = interaction.values[0].replace('edit_', '');
+                const config = await getConfig(key);
+                const modal = createEmbedModal(key, config);
+                await interaction.showModal(modal);
+                return;
+            }
+        }
 
-        return interaction.reply({
-          content: `✅ Successfully saved and applied template changes for **/${targetCmd}**!`,
-          ephemeral: true
-        });
-      }
+        if (interaction.isButton()) {
+            if (interaction.customId === 'open_welcome_modal') {
+                const config = await getConfig('welcome');
+                const modal = createEmbedModal('welcome', config);
+                await interaction.showModal(modal);
+                return;
+            }
+        }
+
+        if (interaction.isChatInputCommand()) {
+            await interaction.deferReply({ ephemeral: true });
+
+            const { commandName, options } = interaction;
+
+            if (commandName === 'embed') {
+                const sub = options.getSubcommand();
+                if (sub === 'dashboard') {
+                    const embed = new EmbedBuilder()
+                        .setTitle('🛡️ Bot Embed Customization Dashboard')
+                        .setColor('#5865F2')
+                        .setDescription('Select any command or module from the dropdown menu below to fully customize its title, color, thumbnail, image, and description.')
+                        .setTimestamp();
+
+                    const row = new ActionRowBuilder().addComponents(
+                        new StringSelectMenuBuilder()
+                            .setCustomId('dashboard_select')
+                            .setPlaceholder('Choose a command/module to customize...')
+                            .addOptions([
+                                { label: 'Welcome Module', value: 'edit_welcome', description: 'Customize greeting embed, thumbnail, and image' },
+                                { label: 'Leveling Module', value: 'edit_leveling', description: 'Customize leveling notification embed' },
+                                { label: 'Ban Command', value: 'edit_ban', description: 'Customize the /ban embed' },
+                                { label: 'Kick Command', value: 'edit_kick', description: 'Customize the /kick embed' },
+                                { label: 'Mute Command', value: 'edit_mute', description: 'Customize the /mute embed' },
+                                { label: 'Unmute Command', value: 'edit_unmute', description: 'Customize the /unmute embed' },
+                                { label: 'Warn Command', value: 'edit_warn', description: 'Customize the /warn embed' },
+                            ])
+                    );
+
+                    await interaction.editReply({ embeds: [embed], components: [row] });
+                }
+            }
+            else if (commandName === 'welcome') {
+                const targetChannel = options.getChannel('channel');
+                const action = options.getString('action');
+
+                if (targetChannel) {
+                    let config = await getConfig('welcome');
+                    config.channelId = targetChannel.id;
+                    await db.update({ command: 'welcome' }, { command: 'welcome', ...config }, { upsert: true });
+                    await interaction.editReply({ content: `✅ Welcome channel successfully set to <#${targetChannel.id}>!` });
+                    return;
+                }
+
+                if (action === 'customize') {
+                    const row = new ActionRowBuilder().addComponents(
+                        new ButtonBuilder()
+                            .setCustomId('open_welcome_modal')
+                            .setLabel('Open Welcome Customizer')
+                            .setStyle(ButtonStyle.Primary)
+                    );
+                    await interaction.editReply({ content: 'Click the button below to open your welcome settings modal:', components: [row] });
+                    return;
+                }
+
+                if (action === 'test') {
+                    const embed = await buildEmbed('welcome', {
+                        user: `<@${interaction.user.id}>`,
+                        server: interaction.guild.name,
+                        memberCount: interaction.guild.memberCount
+                    });
+                    embed.setThumbnail(interaction.user.displayAvatarURL());
+
+                    await interaction.editReply({ content: '🧪 **Welcome Embed Preview:**', embeds: [embed] });
+                    return;
+                }
+
+                await interaction.editReply({ content: '⚠️ Please select a channel or choose a valid action option for the welcome command.' });
+            }
+            else if (commandName === 'ban') {
+                const member = options.getMember('user');
+                const reason = options.getString('reason') || 'No reason provided';
+                if (!member || !member.bannable) {
+                    await interaction.editReply({ content: "❌ I cannot ban this user (missing permissions or higher role)." });
+                    return;
+                }
+
+                await member.ban({ reason });
+                const embed = await buildEmbed('ban', { user: member.user.tag, reason });
+                await interaction.editReply({ embeds: [embed] });
+            }
+            else if (commandName === 'kick') {
+                const member = options.getMember('user');
+                const reason = options.getString('reason') || 'No reason provided';
+                if (!member || !member.kickable) {
+                    await interaction.editReply({ content: "❌ I cannot kick this user (missing permissions or higher role)." });
+                    return;
+                }
+
+                await member.kick(reason);
+                const embed = await buildEmbed('kick', { user: member.user.tag, reason });
+                await interaction.editReply({ embeds: [embed] });
+            }
+            else if (commandName === 'mute') {
+                const member = options.getMember('user');
+                const duration = options.getInteger('duration') || 60;
+                const reason = options.getString('reason') || 'No reason provided';
+
+                if (!member) {
+                    await interaction.editReply({ content: "❌ User not found in this server." });
+                    return;
+                }
+
+                await member.timeout(duration * 60 * 1000, reason);
+                const embed = await buildEmbed('mute', { user: member.user.tag, reason });
+                await interaction.editReply({ embeds: [embed] });
+            }
+            else if (commandName === 'unmute') {
+                const member = options.getMember('user');
+                if (!member) {
+                    await interaction.editReply({ content: "❌ User not found in this server." });
+                    return;
+                }
+                await member.timeout(null);
+                const embed = await buildEmbed('unmute', { user: member.user.tag });
+                await interaction.editReply({ embeds: [embed] });
+            }
+            else if (commandName === 'warn') {
+                const member = options.getMember('user');
+                const reason = options.getString('reason');
+                const embed = await buildEmbed('warn', { user: member.user.tag, reason });
+                await interaction.editReply({ embeds: [embed] });
+            }
+            else if (commandName === 'rank') {
+                const targetUser = options.getUser('user') || interaction.user;
+                const userXpData = await levelsDb.findOne({ userId: targetUser.id, guildId: interaction.guild.id }) || { xp: 0, level: 1 };
+                
+                const rankEmbed = new EmbedBuilder()
+                    .setTitle(`📊 Rank Card: ${targetUser.tag}`)
+                    .setColor('#00ffcc')
+                    .addFields(
+                        { name: 'Level', value: `${userXpData.level}`, inline: true },
+                        { name: 'XP', value: `${userXpData.xp} / ${userXpData.level * 100}`, inline: true }
+                    )
+                    .setThumbnail(targetUser.displayAvatarURL());
+
+                await interaction.editReply({ embeds: [rankEmbed] });
+            }
+        }
+    } catch (err) {
+        console.error(err);
+        const errorMsg = { content: "❌ An error occurred processing this action.", ephemeral: true };
+        if (interaction.deferred || interaction.replied) {
+            await interaction.followUp(errorMsg).catch(() => {});
+        } else if (!interaction.isModalSubmit()) {
+            await interaction.reply(errorMsg).catch(() => {});
+        }
     }
-
-  } catch (interactionError) {
-    systemLog('error', `Unhandled interaction exception: ${interactionError.message}`);
-    if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: '⚠️ An unexpected error occurred while processing your request.', ephemeral: true }).catch(() => {});
-    }
-  }
 });
 
-// Prefix Command Message Listener (?command support)
-client.on('messageCreate', async message => {
-  if (message.author.bot || !message.content.startsWith(PREFIX)) return;
-
-  const cleanBody = message.content.slice(PREFIX.length).trim();
-  const args = cleanBody.split(/ +/);
-  const commandName = args.shift().toLowerCase();
-
-  systemLog('info', `Received prefix execution query: ?${commandName} from ${message.author.tag}`);
-
-  if (['ban', 'unban', 'mute', 'unmute'].includes(commandName)) {
-    await executeCommand(message, commandName, args, false);
-  } else if (commandName === 'embed-dashboard') {
-    message.reply('ℹ️ Please use the official slash command version `/embed-dashboard` to load interactive UI modals.');
-  } else if (commandName === 'moderation-dashboard') {
-    message.reply('ℹ️ Please use the official slash command version `/moderation-dashboard` to load management panels.');
-  }
-});
-
-// ==========================================
-// 8. ERROR BOUNDARIES & BOT INITIALIZATION
-// ==========================================
-process.on('unhandledRejection', error => {
-  systemLog('error', `Unhandled Promise Rejection caught: ${error.message}`);
-  console.error(error);
-});
-
-process.on('uncaughtException', error => {
-  systemLog('error', `Uncaught Exception caught: ${error.message}`);
-  console.error(error);
-});
-
-// Authenticate Bot Instance
-systemLog('info', 'Attempting connection handshake with Discord Gateway...');
-client.login(process.env.TOKEN);
+client.login(TOKEN);
