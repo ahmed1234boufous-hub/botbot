@@ -1,7 +1,7 @@
 /**
  * ----------------------------------------------------------------------------------
  * PROJECT: Advanced Discord Moderation & Embed Dashboard Bot
- * VERSION: 3.0.0 (Enterprise Architecture Monolith)
+ * VERSION: 3.1.0 (Enterprise Architecture Monolith - Native Slash)
  * AUTHOR: Z
  * ----------------------------------------------------------------------------------
  */
@@ -31,18 +31,15 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildModeration,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
+    GatewayIntentBits.GuildMessages
   ]
 });
-
-const PREFIX = '?';
 
 // ==========================================
 // 2. CENTRAL CONFIGURATION & STATE STORE
 // ==========================================
 const botConfig = {
-  version: '3.0.0',
+  version: '3.1.0',
   environment: process.env.NODE_ENV || 'production',
   commands: {
     ban: {
@@ -283,7 +280,7 @@ client.once('ready', async () => {
 // ==========================================
 // 6. CORE COMMAND EXECUTION ENGINE
 // ==========================================
-async function executeCommand(context, commandKey, args, isInteraction) {
+async function executeCommand(interaction, commandKey) {
   const cfg = botConfig.commands[commandKey];
   
   if (!cfg) {
@@ -293,63 +290,52 @@ async function executeCommand(context, commandKey, args, isInteraction) {
 
   // Check if command is enabled in configuration dashboard
   if (!cfg.enabled) {
-    const disabledMsg = '⚠️ This command has been temporarily disabled by server administrators via the moderation dashboard.';
-    return isInteraction ? context.reply({ content: disabledMsg, ephemeral: true }) : context.reply(disabledMsg);
+    return interaction.reply({ 
+      content: '⚠️ This command has been temporarily disabled by server administrators via the moderation dashboard.', 
+      ephemeral: true 
+    });
   }
 
-  const guild = context.guild;
+  const guild = interaction.guild;
   if (!guild) {
-    const guildErr = 'This command can only be executed within a server channel.';
-    return isInteraction ? context.reply({ content: guildErr, ephemeral: true }) : context.reply(guildErr);
+    return interaction.reply({ 
+      content: 'This command can only be executed within a server channel.', 
+      ephemeral: true 
+    });
   }
 
   let targetUser = null;
   let targetMember = null;
-  let reason = 'No reason provided';
+  let reason = interaction.options.getString('reason') || 'No reason provided';
   let durationStr = null;
   let durationMs = null;
   let userId = null;
 
-  // Resolve Arguments based on interaction vs prefix context
-  if (isInteraction) {
-    if (commandKey === 'ban' || commandKey === 'mute') {
-      targetMember = context.options.getMember('target');
-      targetUser = targetMember?.user || null;
-      reason = context.options.getString('reason') || 'No reason provided';
-    }
-    if (commandKey === 'mute') {
-      durationStr = context.options.getString('duration');
-      durationMs = parseDuration(durationStr);
-    }
-    if (commandKey === 'unban') {
-      userId = context.options.getString('userid');
-    }
-    if (commandKey === 'unmute') {
-      targetMember = context.options.getMember('target');
-      targetUser = targetMember?.user || null;
-    }
-  } else {
-    // Prefix execution flow (?command)
-    if (commandKey === 'ban' || commandKey === 'mute' || commandKey === 'unmute') {
-      targetMember = context.mentions.members.first() || guild.members.cache.get(args[0]);
-      targetUser = targetMember?.user || null;
-      reason = args.slice(commandKey === 'mute' ? 2 : 1).join(' ') || 'No reason provided';
-    }
-    if (commandKey === 'mute') {
-      durationStr = args[1];
-      durationMs = parseDuration(durationStr);
-    }
-    if (commandKey === 'unban') {
-      userId = args[0];
-    }
+  // Resolve options based on command type
+  if (commandKey === 'ban' || commandKey === 'mute') {
+    targetMember = interaction.options.getMember('target');
+    targetUser = targetMember?.user || null;
+  }
+  if (commandKey === 'mute') {
+    durationStr = interaction.options.getString('duration');
+    durationMs = parseDuration(durationStr);
+  }
+  if (commandKey === 'unban') {
+    userId = interaction.options.getString('userid');
+  }
+  if (commandKey === 'unmute') {
+    targetMember = interaction.options.getMember('target');
+    targetUser = targetMember?.user || null;
   }
 
   // --- EXECUTION LOGIC PER COMMAND TYPE ---
   try {
     if (commandKey === 'ban') {
       if (!targetMember || !targetMember.bannable) {
-        const errBan = '❌ Error: Invalid target member or insufficient bot role hierarchy permissions to ban this user.';
-        return isInteraction ? context.reply({ content: errBan, ephemeral: true }) : context.reply(errBan);
+        return interaction.reply({ 
+          content: '❌ Error: Invalid target member or insufficient bot role hierarchy permissions to ban this user.', 
+          ephemeral: true 
+        });
       }
 
       if (cfg.sendDm && targetUser) {
@@ -371,16 +357,20 @@ async function executeCommand(context, commandKey, args, isInteraction) {
     
     else if (commandKey === 'unban') {
       if (!userId) {
-        const errUnban = '❌ Error: You must supply a valid 18-digit user account ID to unban.';
-        return isInteraction ? context.reply({ content: errUnban, ephemeral: true }) : context.reply(errUnban);
+        return interaction.reply({ 
+          content: '❌ Error: You must supply a valid 18-digit user account ID to unban.', 
+          ephemeral: true 
+        });
       }
       await guild.members.unban(userId);
     } 
     
     else if (commandKey === 'mute') {
       if (!targetMember || !durationMs) {
-        const errMute = '❌ Error: Invalid member target or incorrect duration format! Use strings like `30s`, `15m`, `2h`, or `1d`.';
-        return isInteraction ? context.reply({ content: errMute, ephemeral: true }) : context.reply(errMute);
+        return interaction.reply({ 
+          content: '❌ Error: Invalid member target or incorrect duration format! Use strings like `30s`, `15m`, `2h`, or `1d`.', 
+          ephemeral: true 
+        });
       }
 
       if (cfg.sendDm && targetUser) {
@@ -407,16 +397,20 @@ async function executeCommand(context, commandKey, args, isInteraction) {
     
     else if (commandKey === 'unmute') {
       if (!targetMember) {
-        const errUnmute = '❌ Error: Target member not found or invalid specification.';
-        return isInteraction ? context.reply({ content: errUnmute, ephemeral: true }) : context.reply(errUnmute);
+        return interaction.reply({ 
+          content: '❌ Error: Target member not found or invalid specification.', 
+          ephemeral: true 
+        });
       }
       await targetMember.timeout(null);
     }
 
   } catch (executionError) {
     systemLog('error', `Execution failure inside module [${commandKey}]: ${executionError.message}`);
-    const failNotice = '⚠️ An internal API error occurred while attempting to execute this moderation action.';
-    return isInteraction ? context.reply({ content: failNotice, ephemeral: true }) : context.reply(failNotice);
+    return interaction.reply({ 
+      content: '⚠️ An internal API error occurred while attempting to execute this moderation action.', 
+      ephemeral: true 
+    });
   }
 
   // --- RENDER PUBLIC EMBED & BUTTON COMPONENTS ---
@@ -442,14 +436,12 @@ async function executeCommand(context, commandKey, args, isInteraction) {
     ephemeral: !cfg.public
   };
 
-  return context.reply(payload);
+  return interaction.reply(payload);
 }
 
 // ==========================================
-// 7. EVENT HANDLERS (INTERACTIONS & MESSAGES)
+// 7. EVENT HANDLERS (INTERACTIONS)
 // ==========================================
-
-// Chat Input & Component Interaction Listener
 client.on('interactionCreate', async interaction => {
   try {
     // A. Slash Command Handler
@@ -467,7 +459,7 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({
           content: '**🎨 Embed Dashboard Control Panel**\nSelect an action below to modify embed titles, markdown body descriptions, images, thumbnails, and interactive row styles.',
           components: [dashboardRow],
-          ephemeral: false
+          ephemeral: true
         });
       }
 
@@ -485,12 +477,12 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({
           content: `**⚙️ Moderation Settings Dashboard**\n\n${statusSummary}\n\n*Use control keys below to reconfigure parameters:*`,
           components: [modRow],
-          ephemeral: false
+          ephemeral: true
         });
       }
 
       else if (['ban', 'unban', 'mute', 'unmute'].includes(commandName)) {
-        await executeCommand(interaction, commandName, [], true);
+        await executeCommand(interaction, commandName);
       }
     }
 
@@ -554,8 +546,8 @@ client.on('interactionCreate', async interaction => {
 
       else if (customId.startsWith('mod_toggle_')) {
         const tokens = customId.split('_');
-        const actionType = tokens[2]; // toggle or dm
-        const subjectCmd = tokens[3]; // ban or mute
+        const actionType = tokens[2]; 
+        const subjectCmd = tokens[3]; 
 
         if (actionType === 'toggle') {
           botConfig.commands[subjectCmd].enabled = !botConfig.commands[subjectCmd].enabled;
@@ -615,25 +607,6 @@ client.on('interactionCreate', async interaction => {
     if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
       await interaction.reply({ content: '⚠️ An unexpected error occurred while processing your request.', ephemeral: true }).catch(() => {});
     }
-  }
-});
-
-// Prefix Command Message Listener (?command support)
-client.on('messageCreate', async message => {
-  if (message.author.bot || !message.content.startsWith(PREFIX)) return;
-
-  const cleanBody = message.content.slice(PREFIX.length).trim();
-  const args = cleanBody.split(/ +/);
-  const commandName = args.shift().toLowerCase();
-
-  systemLog('info', `Received prefix execution query: ?${commandName} from ${message.author.tag}`);
-
-  if (['ban', 'unban', 'mute', 'unmute'].includes(commandName)) {
-    await executeCommand(message, commandName, args, false);
-  } else if (commandName === 'embed-dashboard') {
-    message.reply('ℹ️ Please use the official slash command version `/embed-dashboard` to load interactive UI modals.');
-  } else if (commandName === 'moderation-dashboard') {
-    message.reply('ℹ️ Please use the official slash command version `/moderation-dashboard` to load management panels.');
   }
 });
 
