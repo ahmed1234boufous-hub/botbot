@@ -56,7 +56,7 @@ function parseDuration(durationStr) {
   }
 }
 
-// Helper to build action rows based on config layout preference (separate or slide)
+// Helper to build action rows
 function buildCommandButtons(cmdKey) {
   const cfg = botConfig.commands[cmdKey];
   if (cfg.buttonStyle === 'slide') {
@@ -67,7 +67,6 @@ function buildCommandButtons(cmdKey) {
       )
     ];
   } else {
-    // Separate interactive buttons
     return [
       new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`action_approve_${cmdKey}`).setLabel('Log Action').setStyle(ButtonStyle.Success),
@@ -90,11 +89,25 @@ const slashCommands = [
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}!`);
   const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
+  
   try {
-    await rest.put(Routes.applicationCommands(client.user.id), { body: slashCommands });
-    console.log('Successfully registered global slash commands.');
+    if (process.env.GUILD_ID) {
+      console.log(`Refreshing guild-specific commands for Guild ID: ${process.env.GUILD_ID}...`);
+      await rest.put(
+        Routes.applicationGuildCommands(client.user.id, process.env.GUILD_ID),
+        { body: slashCommands },
+      );
+      console.log('✅ Successfully registered commands to your guild!');
+    } else {
+      console.log('Refreshing global commands...');
+      await rest.put(
+        Routes.applicationCommands(client.user.id),
+        { body: slashCommands },
+      );
+      console.log('✅ Successfully registered global application commands.');
+    }
   } catch (err) {
-    console.error(err);
+    console.error('❌ Failed to register slash commands:', err);
   }
 });
 
@@ -125,7 +138,6 @@ async function executeCommand(context, commandKey, args, isInteraction) {
       targetUser = targetMember?.user;
     }
   } else {
-    // Prefix execution (?command)
     if (commandKey === 'ban' || commandKey === 'mute' || commandKey === 'unmute') {
       targetMember = context.mentions.members.first() || guild.members.cache.get(args[0]);
       targetUser = targetMember?.user;
@@ -140,7 +152,6 @@ async function executeCommand(context, commandKey, args, isInteraction) {
     }
   }
 
-  // --- EXECUTION & ACTIONS ---
   if (commandKey === 'ban') {
     if (!targetMember || !targetMember.bannable) {
       const msg = 'Invalid target or I cannot ban this user.';
@@ -189,7 +200,6 @@ async function executeCommand(context, commandKey, args, isInteraction) {
     await targetMember.timeout(null);
   }
 
-  // Build Response Embed & Components
   const publicEmbed = new EmbedBuilder()
     .setTitle(cfg.title)
     .setDescription(
@@ -205,13 +215,7 @@ async function executeCommand(context, commandKey, args, isInteraction) {
   if (cfg.image) publicEmbed.setImage(cfg.image);
 
   const components = buildCommandButtons(commandKey);
-  const payload = { embeds: [publicEmbed], components, ephemeral: !cfg.public };
-
-  if (isInteraction) {
-    await context.reply(payload);
-  } else {
-    await context.reply(payload);
-  }
+  await context.reply({ embeds: [publicEmbed], components, ephemeral: !cfg.public });
 }
 
 // --- EVENT HANDLERS ---
@@ -219,7 +223,6 @@ client.on('interactionCreate', async interaction => {
   if (interaction.isChatInputCommand()) {
     const { commandName } = interaction;
 
-    // 1. Embed Dashboard
     if (commandName === 'embed-dashboard') {
       const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('edit_embed_ban').setLabel('Edit /ban Embed').setStyle(ButtonStyle.Primary),
@@ -228,13 +231,12 @@ client.on('interactionCreate', async interaction => {
       );
 
       await interaction.reply({
-        content: '**🎨 Embed Dashboard**\nCustomize command visuals, titles, descriptions, images, thumbnails, and button styles (separate vs slide).',
+        content: '**🎨 Embed Dashboard**\nCustomize command visuals, titles, descriptions, images, thumbnails, and button styles.',
         components: [row],
         ephemeral: false
       });
     }
 
-    // 2. Moderation Dashboard
     else if (commandName === 'moderation-dashboard') {
       const summary = Object.entries(botConfig.commands).map(([key, val]) => 
         `**/${val.name}** | Enabled: \`${val.enabled}\` | Public: \`${val.public}\` | Send DMs: \`${val.sendDm}\``
@@ -253,13 +255,11 @@ client.on('interactionCreate', async interaction => {
       });
     }
 
-    // Moderation Commands Routing
     else if (['ban', 'unban', 'mute', 'unmute'].includes(commandName)) {
       await executeCommand(interaction, commandName, [], true);
     }
   }
 
-  // Handle Dashboard Buttons & Customizations
   else if (interaction.isButton()) {
     if (interaction.customId === 'edit_embed_ban' || interaction.customId === 'edit_embed_mute') {
       const cmdKey = interaction.customId.includes('ban') ? 'ban' : 'mute';
@@ -287,7 +287,7 @@ client.on('interactionCreate', async interaction => {
 
     else if (interaction.customId.startsWith('mod_toggle_')) {
       const parts = interaction.customId.split('_');
-      const actionType = parts[2]; // toggle or dm
+      const actionType = parts[2];
       const targetCmd = parts[3];
 
       if (actionType === 'toggle') {
@@ -300,7 +300,6 @@ client.on('interactionCreate', async interaction => {
     }
   }
 
-  // Handle Modal Submissions
   else if (interaction.isModalSubmit()) {
     if (interaction.customId === 'modal_edit_ban' || interaction.customId === 'modal_edit_mute') {
       const cmdKey = interaction.customId.includes('ban') ? 'ban' : 'mute';
