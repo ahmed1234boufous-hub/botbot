@@ -1,13 +1,9 @@
 {
-  "name": "custom-mod-dashboard-bot",
-  "version": "2.0.0",
-  "description": "Discord bot with dual prefix/slash commands, embed editor, and moderation dashboards",
+  "name": "customizable-moderation-bot",
+  "version": "1.0.0",
+  "description": "Configurable Discord moderation bot with embeds, slides, links, visibility, and DMs.",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "dependencies": {
-    "discord.js": "^14.14.1",
-    "dotenv": "^16.4.5"
-  }
+  "scripts": { "start": "node index.js" },
+  "engines": { "node": ">=20.0.0" },
+  "dependencies": { "discord.js": "^14.21.0", "dotenv": "^16.4.7" }
 }
