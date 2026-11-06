@@ -10,6 +10,7 @@ const {
 const TOKEN = (process.env.DISCORD_TOKEN || '').trim();
 const CLIENT_ID = (process.env.CLIENT_ID || '').trim();
 const GUILD_ID = (process.env.GUILD_ID || '').trim();
+const SUNNAH_API_KEY = (process.env.SUNNAH_API_KEY || '').trim();
 const STATE_FILE = path.join(__dirname, 'bot-state.json');
 const CATALOG = [
   // Direct, familiar moderation commands: no /mod prefix.
@@ -254,11 +255,135 @@ function addOption(builder, field) {
   const [description,max] = details[field] || [field,100];
   return builder.addStringOption(o=>o.setName(field).setDescription(description).setMaxLength(max).setRequired(!optional));
 }
+function clipText(value, max=3900) { const text=String(value||'').trim();return text.length>max?`${text.slice(0,max-20)}â€¦ [truncated]`:text; }
+async function fetchQuranAyah(reference) {
+  if(!/^\d{1,3}:\d{1,3}$/.test(reference))throw new Error('Use a Quran reference like `1:1` or `2:255`.');
+  const base='https://api.alquran.cloud/v1/ayah/';
+  const [arRes,enRes]=await Promise.all([
+    fetch(`${base}${encodeURIComponent(reference)}/quran-uthmani`,{signal:AbortSignal.timeout(12000)}),
+    fetch(`${base}${encodeURIComponent(reference)}/en.sahih`,{signal:AbortSignal.timeout(12000)}),
+  ]);
+  if(!arRes.ok||!enRes.ok)throw new Error('The Quran text service did not return that reference. Check the surah and ayah numbers.');
+  const [ar,en]=await Promise.all([arRes.json(),enRes.json()]);
+  if(ar.code!==200||en.code!==200||!ar.data?.text)throw new Error('That Quran reference was not found.');
+  return {reference,arabic:ar.data.text,translation:en.data?.text||'',surah:ar.data.surah?.englishName||'',source:'Al Quran Cloud; English translation: Saheeh International'};
+}
+// Sunnah.com identifies a collection by its API slug and each hadith by its
+// Sunnah.com reference number (which can differ from another edition's numbering).
+// Resolve the available catalog dynamically instead of hardcoding a fixed count.
+const SUNNAH_ALIASES = {
+  bukhari: ['sahih bukhari','sahih al bukhari','sahih al-bukhari','al bukhari','bukhari'],
+  muslim: ['sahih muslim','sahih al muslim','muslim'],
+  abudawud: ['sunan abi dawud','sunan abu dawud','abu dawud','abu dawood','abi dawud'],
+  tirmidhi: ['jami at tirmidhi','jami tirmidhi','sunan tirmidhi','tirmidhi','at tirmidhi'],
+  nasai: ['sunan an nasai','sunan nasai','an nasai','nasa i','nasai'],
+  ibnmajah: ['sunan ibn majah','ibn majah','ibn e majah'],
+  malik: ['muwatta malik','muwatta imam malik','muwatta'],
+  ahmad: ['musnad ahmad','musnad imam ahmad'],
+  darimi: ['sunan darimi','sunan ad darimi','ad darimi','darimi'],
+  riyadussalihin: ['riyad as salihin','riyadh as salihin','riyad us salihin','riyadussalihin'],
+  adab: ['al adab al mufrad','adab al mufrad'],
+  shamail: ['shamail muhammadiyah','ash shamail','shamail'],
+  mishkat: ['mishkat al masabih','mishkat masabih','mishkat'],
+  bulugh: ['bulugh al maram','bulugh'],
+};
+const SUNNAH_CATALOG_TTL = 60 * 60 * 1000;
+let sunnahCatalogCache = {expires:0,items:null};
+let sunnahCatalogInFlight = null;
+function normalizeCollectionName(value) {
+  return String(value||'').normalize('NFKD').replace(/\p{M}/gu,'').toLowerCase()
+    .replace(/[â€™'`Ê»Ê¼Ê¿Ê¾]/g,'').replace(/[^\p{L}\p{N}]+/gu,' ').trim().replace(/\s+/g,' ');
+}
+async function sunnahJson(path) {
+  if(!SUNNAH_API_KEY)throw new Error('Hadith lookup is not configured. Add SUNNAH_API_KEY to the bot hostâ€™s secret environment variables.');
+  const res=await fetch(`https://api.sunnah.com/v1${path}`,{
+    headers:{'X-API-KEY':SUNNAH_API_KEY,Accept:'application/json'},signal:AbortSignal.timeout(12000)
+  });
+  if(res.status===401||res.status===403)throw new Error('Sunnah.com rejected the API key. Check SUNNAH_API_KEY in your host secrets.');
+  if(res.status===404){const e=new Error('That reference was not found in the Sunnah.com API.');e.code='NOT_FOUND';throw e;}
+  if(res.status===429)throw new Error('Sunnah.com is rate-limiting requests. Please try again later.');
+  if(!res.ok)throw new Error(`Sunnah.com returned HTTP ${res.status}. Please try again later.`);
+  return res.json();
+}
+async function getSunnahCollections() {
+  if(sunnahCatalogCache.items && sunnahCatalogCache.expires>Date.now())return sunnahCatalogCache.items;
+  if(sunnahCatalogInFlight)return sunnahCatalogInFlight;
+  sunnahCatalogInFlight=(async()=>{
+    const all=[];const seen=new Set();let page=1;
+    // The API is paginated; never publish/cache an incomplete listing as complete.
+    while(page!==null){
+      if(!Number.isInteger(page)||page<1||seen.has(page)||seen.size>=100)throw new Error('Sunnah.com collection pagination was incomplete; try again later.');
+      seen.add(page);const data=await sunnahJson(`/collections?limit=100&page=${page}`);
+      if(!Array.isArray(data.data))throw new Error('Unexpected Sunnah.com collection response.');
+      for(const c of data.data){
+        if(typeof c.name!=='string'||!/^[a-z0-9_-]+$/i.test(c.name))continue;
+        const titles=Array.isArray(c.collection)?c.collection.filter(t=>typeof t?.title==='string').map(t=>({lang:t.lang,title:t.title})):[];
+        all.push({slug:c.name,title:titles.find(t=>t.lang==='en')?.title||c.name,titles});
+      }
+      page=data.next==null?null:Number(data.next);
+    }
+    if(!all.length)throw new Error('Sunnah.com returned an empty collection list.');
+    sunnahCatalogCache={items:all,expires:Date.now()+SUNNAH_CATALOG_TTL};return all;
+  })();
+  try{return await sunnahCatalogInFlight;}finally{sunnahCatalogInFlight=null;}
+}
+function splitHadithReference(raw){
+  const match=String(raw||'').trim().match(/^(.{1,100}?)(?:\s+|\s*:\s*)(\d+[a-z]?)$/i);
+  if(!match)throw new Error('Use a collection and hadith number, for example `Sahih Bukhari 1` or `bukhari:1`.');
+  return {name:match[1].trim(),number:match[2].toLowerCase()};
+}
+function resolveSunnahCollection(name, catalog){
+  const normalized=normalizeCollectionName(name);
+  const matches=catalog.filter(c=>{
+    const variants=[c.slug,c.title,...c.titles.map(t=>t.title),...(SUNNAH_ALIASES[c.slug]||[])];
+    return variants.some(v=>normalizeCollectionName(v)===normalized);
+  });
+  if(matches.length>1)throw new Error(`That collection name is ambiguous. Use a collection slug: ${matches.map(c=>c.slug).join(', ')}.`);
+  if(!matches.length){const e=new Error('Collection not found. Use an exact Sunnah.com collection name or slug, such as `bukhari`, `malik`, or `riyadussalihin`.');e.code='UNKNOWN_COLLECTION';throw e;}
+  return matches[0];
+}
+// API body fields may contain markup. Strip tags and decode common HTML
+// entities for Discord display, without fabricating or paraphrasing the text.
+function plainHadithText(html) {
+  return String(html||'').replace(/<\s*br\s*\/?>/gi,'\n').replace(/<\/(?:p|div|li|tr|h[1-6])\s*>/gi,'\n')
+    .replace(/<[^>]*>/g,'').replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos|nbsp);/gi,(_,entity)=>{
+      const lower=entity.toLowerCase(), map={amp:'&',lt:'<',gt:'>',quot:'"',apos:"'",nbsp:' '};
+      if(map[lower]!==undefined)return map[lower];
+      const number=lower.startsWith('#x')?parseInt(lower.slice(2),16):parseInt(lower.slice(1),10);
+      return Number.isInteger(number)&&number>=0&&number<=0x10ffff&&!(number>=0xd800&&number<=0xdfff)?String.fromCodePoint(number):'ï¿½';
+    }).replace(/\n[ \t]*\n[ \t]*\n/g,'\n\n').trim();
+}
+async function fetchHadith(reference) {
+  const parsed=splitHadithReference(reference);
+  const catalog=await getSunnahCollections();
+  const collection=resolveSunnahCollection(parsed.name,catalog);
+  const obj=await sunnahJson(`/collections/${encodeURIComponent(collection.slug)}/hadiths/${encodeURIComponent(parsed.number)}`);
+  if(!obj||!Array.isArray(obj.hadith))throw new Error('Sunnah.com returned an unexpected hadith format.');
+  const ar=obj.hadith.find(h=>h.lang==='ar');const en=obj.hadith.find(h=>h.lang==='en');
+  const arabic=plainHadithText(ar?.body),english=plainHadithText(en?.body);
+  if(!arabic&&!english)throw new Error('This hadith has no Arabic or English text available from Sunnah.com.');
+  const actualNumber=String(obj.hadithNumber||parsed.number);
+  // Make only safe, canonical links from the collection slug and reference number.
+  if(!/^[a-z0-9_-]+$/i.test(collection.slug)||!/^\d+[a-z]?$/i.test(actualNumber))throw new Error('Unexpected reference returned by Sunnah.com.');
+  const grades=(en?.grades||[]).filter(g=>g?.grade&&g?.graded_by).map(g=>`${g.grade} (${g.graded_by})`).join('; ');
+  return {title:collection.title,number:actualNumber,arabic,english,grades,url:`https://sunnah.com/${collection.slug}:${actualNumber}`};
+}
+function hadithEmbed(item){
+  const embed=new EmbedBuilder().setColor(0x168B62).setTitle(`${item.title} Â· ${item.number}`.slice(0,256)).setURL(item.url);
+  if(item.arabic)embed.addFields({name:'Arabic',value:clipText(item.arabic,1000)});
+  if(item.english)embed.addFields({name:'English',value:clipText(item.english,1000)});
+  if(item.grades)embed.addFields({name:'Grade as reported by Sunnah.com',value:clipText(item.grades,1000)});
+  embed.setFooter({text:'Source: Sunnah.com. Text may be truncated; open the title link for the full reference.'});
+  return embed;
+}
+
 async function syncCommands() {
   const fixed = [
     new SlashCommandBuilder().setName('embed-dashboard').setDescription('Customize every moderation command response embed'),
     new SlashCommandBuilder().setName('moderation-dashboard').setDescription('Enable, rename, and configure moderation commands'),
     new SlashCommandBuilder().setName('logs-setup').setDescription('Configure all server logs, including AutoMod logs'),
+    new SlashCommandBuilder().setName('quran').setDescription('Look up a Quran ayah by reference, for example 2:255').addStringOption(o=>o.setName('reference').setDescription('Surah:ayah, e.g. 1:1 or 2:255').setRequired(true).setMaxLength(20)),
+    new SlashCommandBuilder().setName('hadith').setDescription('Look up a Hadith, for example Sahih Bukhari 1').addStringOption(o=>o.setName('reference').setDescription('Collection and number, e.g. Sahih Bukhari 1').setRequired(true).setMaxLength(100)),
     ...WORKBOOK_MODULES.map(m => new SlashCommandBuilder().setName(m.panel).setDescription(`Browse ${m.name} features in an interactive panel`.slice(0,100))),
   ];
   const commands = CATALOG.map(def => {
@@ -516,10 +641,42 @@ client.once(Events.ClientReady,async c=>{console.log(`Ready as ${c.user.tag}`);f
 client.on(Events.GuildMemberAdd,async member=>{const c=state.welcome;if(!c.enabled||!c.channelId)return;const ch=await member.guild.channels.fetch(c.channelId).catch(()=>null);if(!ch?.isTextBased())return;const e=previewServerEmbed('welcome');e.setTitle(fill(c.title,{server:member.guild.name,user:member.user.username,memberCount:member.guild.memberCount}));e.setDescription(fill(c.message,{server:member.guild.name,user:`<@${member.id}>`,memberCount:member.guild.memberCount}));await ch.send({embeds:[e]}).catch(err=>console.error('Welcome send failed:',err.message));await logEvent(member.guild,'members',`${member.user.tag} joined the server.`);});
 client.on(Events.GuildMemberRemove,async member=>{const c=state.leave;if(!c.enabled||!c.channelId)return;const ch=await member.guild.channels.fetch(c.channelId).catch(()=>null);if(!ch?.isTextBased())return;const e=previewServerEmbed('leave');e.setTitle(fill(c.title,{server:member.guild.name,user:member.user.username,memberCount:member.guild.memberCount}));e.setDescription(fill(c.message,{server:member.guild.name,user:`${member.user.username} (${member.user.tag})`,memberCount:member.guild.memberCount}));await ch.send({embeds:[e]}).catch(err=>console.error('Leave send failed:',err.message));await logEvent(member.guild,'members',`${member.user.tag} left the server.`);});
 client.on(Events.MessageCreate,async m=>{handleAutoModMessage(m).catch(e=>console.error('AutoMod error:',e.message));if(!m.guild||m.author.bot)return;const key=`${m.guild.id}:${m.author.id}`;if(state.afkUsers[key]){delete state.afkUsers[key];save();m.reply('Welcome back, I removed your AFK status.').catch(()=>{});}for(const u of m.mentions.users.values()){const afk=state.afkUsers[`${m.guild.id}:${u.id}`];if(afk)m.reply(`${u.username} is AFK: ${afk.reason}`).catch(()=>{});}});
+// Respond to an exact, standalone reference typed as a normal message.
+// The user's bot must have Message Content Intent enabled in the Developer Portal.
+const hadithMessageCooldown = new Map();
+client.on(Events.MessageCreate, async message=>{
+  if(!message.guild || message.author?.bot || !SUNNAH_API_KEY)return;
+  const input=(message.content||'').trim();
+  if(input.length>110||!/^.{1,100}?(?:\s+|\s*:\s*)\d+[a-z]?$/i.test(input))return;
+  const now=Date.now(),key=`${message.guild.id}:${message.author.id}`;
+  if(now-(hadithMessageCooldown.get(key)||0)<5000)return;
+  hadithMessageCooldown.set(key,now);
+  if(hadithMessageCooldown.size>5000){for(const [k,t] of hadithMessageCooldown)if(now-t>60000)hadithMessageCooldown.delete(k);}
+  try{
+    const item=await fetchHadith(input);
+    await message.reply({embeds:[hadithEmbed(item)],allowedMentions:{parse:[],repliedUser:false}});
+  }catch(error){
+    // Unknown names should not produce noise for normal messages such as 'room 1'.
+    if(error.code==='UNKNOWN_COLLECTION')return;
+    if(error.code==='NOT_FOUND')return message.reply({content:'That hadith reference was not found in the Sunnah.com API.',allowedMentions:{parse:[],repliedUser:false}}).catch(()=>{});
+    console.error('Hadith lookup failed:',error.name,error.message);
+    // Do not expose credentials or dump raw service responses into Discord.
+  }
+});
 client.on(Events.MessageReactionRemove,async(reaction,user)=>{if(reaction.partial)await reaction.fetch().catch(()=>null);if(user.bot||!reaction.message.guild)return;for(const bind of state.records.reactionRoles||[]){if(bind.guildId===reaction.message.guild.id&&bind.messageId===reaction.message.id&&(bind.emoji===reaction.emoji.name||bind.emoji===reaction.emoji.toString()||bind.emoji===reaction.emoji.id)){const member=await reaction.message.guild.members.fetch(user.id).catch(()=>null);const role=await reaction.message.guild.roles.fetch(bind.roleId).catch(()=>null);if(member&&role)await member.roles.remove(role,'Reaction role removed').catch(()=>{});}}});
 client.on(Events.MessageReactionAdd,async(reaction,user)=>{if(reaction.partial)await reaction.fetch().catch(()=>null);if(user.bot)return;const m=reaction.message;if(m.guild){for(const bind of state.records.reactionRoles||[]){if(bind.guildId===m.guild.id&&bind.messageId===m.id&&(bind.emoji===reaction.emoji.name||bind.emoji===reaction.emoji.toString()||bind.emoji===reaction.emoji.id)){const member=await m.guild.members.fetch(user.id).catch(()=>null);const role=await m.guild.roles.fetch(bind.roleId).catch(()=>null);if(member&&role&&role.position<m.guild.members.me.roles.highest.position)await member.roles.add(role,'Reaction role').catch(()=>{});}}}if(!m.guild||reaction.emoji.name!=='â­'||!state.starboard.channelId)return;if(reaction.count<state.starboard.threshold||m.channelId===state.starboard.channelId)return;const dest=await m.guild.channels.fetch(state.starboard.channelId).catch(()=>null);if(!dest?.isTextBased())return;const embed=new EmbedBuilder().setColor(0xF1C40F).setAuthor({name:m.author?.tag||'Member',iconURL:m.author?.displayAvatarURL()}).setDescription(`${m.content||'(attachment)'}\n\n[Jump to message](${m.url})`).setFooter({text:`â­ ${reaction.count} Â· #${m.channel.name}`});await dest.send({embeds:[embed]}).catch(()=>{});});
 client.on(Events.InteractionCreate,async i=>{try{
   if(i.isChatInputCommand()){
+    if(i.commandName==='quran'){
+      await i.deferReply();
+      try{const item=await fetchQuranAyah(i.options.getString('reference',true).trim());const embed=new EmbedBuilder().setColor(0x168B62).setTitle(`${item.surah} Â· ${item.reference}`).setDescription(`**Arabic**\n${clipText(item.arabic,1800)}\n\n**Saheeh International**\n${clipText(item.translation,1800)}`).setFooter({text:item.source});return i.editReply({embeds:[embed]});}
+      catch(e){return i.editReply({content:e.name==='TimeoutError'?'Quran lookup timed out. Try again.':e.message||'Quran lookup failed.'});}
+    }
+    if(i.commandName==='hadith'){
+      await i.deferReply();
+      try{const item=await fetchHadith(i.options.getString('reference',true));return i.editReply({embeds:[hadithEmbed(item)],allowedMentions:{parse:[]}});}
+      catch(e){return i.editReply({content:e.name==='TimeoutError'?'Hadith lookup timed out. Try again.':e.message||'Hadith lookup failed.'});}
+    }
     const panelModule=WORKBOOK_MODULES.find(m=>m.panel===i.commandName);if(panelModule){if(panelModule.name==='Owner'&&!isAdmin(i))return deny(i);return i.reply(modulePanel(panelModule.name));}
     if(['embed-dashboard','moderation-dashboard','logs-setup','ticket-setup','welcome-setup','leave-setup','automod-setup'].includes(i.commandName)){if(!isAdmin(i))return deny(i);if(i.commandName==='embed-dashboard')return i.reply(embedDash('ban'));if(i.commandName==='moderation-dashboard')return i.reply(modDash('ban'));if(i.commandName==='logs-setup')return i.reply(logsDash());if(i.commandName==='ticket-setup')return i.reply(serverDash('tickets'));if(i.commandName==='welcome-setup')return i.reply(serverDash('welcome'));if(i.commandName==='leave-setup')return i.reply(serverDash('leave'));if(i.commandName==='automod-setup')return i.reply(automodDash());}
     const def=CATALOG.find(x=>slashName(x.name)===i.commandName);if(def)return executeCatalogCommand(i,def.name);
