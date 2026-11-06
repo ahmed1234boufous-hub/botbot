@@ -7,9 +7,8 @@ const {
   GatewayIntentBits, ModalBuilder, Partials, PermissionFlagsBits, REST, Routes,
   SlashCommandBuilder, StringSelectMenuBuilder, TextInputBuilder, TextInputStyle,
 } = require('discord.js');
-const { DISCORD_TOKEN: TOKEN, CLIENT_ID, GUILD_ID, DEEPSEEK_API_KEY } = process.env;
-const AI_MODEL = process.env.AI_MODEL || 'deepseek-flash';
-const askCooldowns = new Map();
+const TOKEN = (process.env.DISCORD_TOKEN || '').trim();
+const { CLIENT_ID, GUILD_ID } = process.env;
 const STATE_FILE = path.join(__dirname, 'bot-state.json');
 const CATALOG = [
   // Direct, familiar moderation commands: no /mod prefix.
@@ -113,7 +112,7 @@ const BUILT_FEATURES = new Set([
   'ticket-setup','ticket-panel','ticket-open','ticket-close','ticket-add','ticket-remove','ticket-claim','ticket-transcript','ticket-stats',
   'welcome-setup','welcome-test','leave-setup','role-menu','role-add','role-remove','role-info','role-reaction-menu',
   'poll-create','giveaway-start','giveaway-end','suggest','suggest-review','starboard-setup','afk',
-  'info-user','info-server','info-avatar','info-role','info-channel','remind','tag','ask',
+  'info-user','info-server','info-avatar','info-role','info-channel','remind','tag',
 ]);
 function featuresForModule(moduleName) {
   return WORKBOOK_FEATURES.filter(x => x.module === moduleName);
@@ -254,32 +253,12 @@ function addOption(builder, field) {
   const [description,max] = details[field] || [field,100];
   return builder.addStringOption(o=>o.setName(field).setDescription(description).setMaxLength(max).setRequired(!optional));
 }
-async function askDeepSeek(question) {
-  if (!DEEPSEEK_API_KEY) throw new Error('AI_NOT_CONFIGURED');
-  const response = await fetch('https://api.deepseek.com/chat/completions', {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${DEEPSEEK_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: AI_MODEL, messages: [{ role: 'user', content: question }], max_tokens: 700 }),
-    signal: AbortSignal.timeout(30000),
-  });
-  if (!response.ok) {
-    const err = new Error(`AI request failed with HTTP ${response.status}`);
-    err.status = response.status;
-    throw err;
-  }
-  const data = await response.json();
-  const text = data.choices?.[0]?.message?.content;
-  if (typeof text !== 'string' || !text) throw new Error('AI returned no text.');
-  return text;
-}
-
 async function syncCommands() {
   const fixed = [
     new SlashCommandBuilder().setName('embed-dashboard').setDescription('Customize every moderation command response embed'),
     new SlashCommandBuilder().setName('moderation-dashboard').setDescription('Enable, rename, and configure moderation commands'),
     new SlashCommandBuilder().setName('logs-setup').setDescription('Configure all server logs, including AutoMod logs'),
     ...WORKBOOK_MODULES.map(m => new SlashCommandBuilder().setName(m.panel).setDescription(`Browse ${m.name} features in an interactive panel`.slice(0,100))),
-    new SlashCommandBuilder().setName('ask').setDescription('Ask the connected AI model a question').addStringOption(o => o.setName('question').setDescription('What do you want to ask?').setRequired(true).setMaxLength(4000)),
   ];
   const commands = CATALOG.map(def => {
     let b = new SlashCommandBuilder().setName(slashName(def.name)).setDescription(def.description.toLowerCase().slice(0, 100));
@@ -530,13 +509,6 @@ client.on(Events.MessageReactionAdd,async(reaction,user)=>{if(reaction.partial)a
 client.on(Events.InteractionCreate,async i=>{try{
   if(i.isChatInputCommand()){
     const panelModule=WORKBOOK_MODULES.find(m=>m.panel===i.commandName);if(panelModule){if(panelModule.name==='Owner'&&!isAdmin(i))return deny(i);return i.reply(modulePanel(panelModule.name));}
-    if(i.commandName==='ask'){
-      if(!DEEPSEEK_API_KEY)return i.reply({content:'AI is not configured yet. Add DEEPSEEK_API_KEY to your hostâ€™s environment variables and restart the bot.',ephemeral:true});
-      const now=Date.now(),last=askCooldowns.get(i.user.id)||0;if(now-last<5000)return i.reply({content:'Give it a few seconds before asking again.',ephemeral:true});askCooldowns.set(i.user.id,now);
-      await i.deferReply({ephemeral:true});
-      try{const answer=await askDeepSeek(i.options.getString('question',true));return i.editReply({content:answer.slice(0,1900)||'The model returned an empty answer.'});}
-      catch(e){console.error('AI request failed:',e.status||e.message);return i.editReply({content:e.message==='AI_NOT_CONFIGURED'?'AI is not configured.':e.name==='TimeoutError'?'The AI request timed out. Try again.':'AI request failed. Check the configured key, model access, and API billing.'});}
-    }
     if(['embed-dashboard','moderation-dashboard','logs-setup','ticket-setup','welcome-setup','leave-setup','automod-setup'].includes(i.commandName)){if(!isAdmin(i))return deny(i);if(i.commandName==='embed-dashboard')return i.reply(embedDash('ban'));if(i.commandName==='moderation-dashboard')return i.reply(modDash('ban'));if(i.commandName==='logs-setup')return i.reply(logsDash());if(i.commandName==='ticket-setup')return i.reply(serverDash('tickets'));if(i.commandName==='welcome-setup')return i.reply(serverDash('welcome'));if(i.commandName==='leave-setup')return i.reply(serverDash('leave'));if(i.commandName==='automod-setup')return i.reply(automodDash());}
     const def=CATALOG.find(x=>slashName(x.name)===i.commandName);if(def)return executeCatalogCommand(i,def.name);
   }
@@ -598,4 +570,11 @@ client.on(Events.InteractionCreate,async i=>{try{
     if(i.customId==='modal:ticketintro'){for(const id of ['intro','closeButton','closedPrefix'])state.tickets[id]=i.fields.getTextInputValue(id).trim();save();return i.reply(serverDash('tickets'));}
   }
 }catch(e){console.error('Interaction failed:',e);const p={content:'Something went wrong. Check the bot console for details.',ephemeral:true};if(i.replied||i.deferred)await i.followUp(p).catch(()=>{});else await i.reply(p).catch(()=>{});}});
-client.login(TOKEN);
+client.login(TOKEN).catch(error => {
+  if (error?.code === 'TokenInvalid' || error?.name === 'TokenInvalid') {
+    console.error('Discord rejected DISCORD_TOKEN. In your host dashboard, replace it with the current Bot Token from Discord Developer Portal â†’ Application â†’ Bot. Do not use the Client Secret, public key, or DeepSeek API key. Remove surrounding quotes/spaces, save, then restart.');
+  } else {
+    console.error('Discord client login failed:', error?.message || error);
+  }
+  process.exitCode = 1;
+});
